@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#101418">
+  <meta name="description" content="Vecmocon Industrial Leak Tester — Charger scan station">
+  <title>Vecmocon Leak Tester — Scan Station</title>
+
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" href="icon-192.png">
+  <link rel="apple-touch-icon" href="icon-192.png">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+
+  <!-- html5-qrcode: FALLBACK ONLY (used when the browser has no native
+       BarcodeDetector). Primary scanning is done by scanner.js. -->
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+</head>
+<body>
+
+  <!-- ================= HEADER ================= -->
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-name">VECMOCON</span>
+      <span class="brand-sub">Industrial Leak Tester</span>
+    </div>
+    <div class="conn" id="connBadge" data-state="checking">
+      <span class="conn-led"></span>
+      <span class="conn-text" id="connText">CHECKING</span>
+    </div>
+  </header>
+
+  <main class="app-main">
+
+    <!-- ================= HOME SCREEN ================= -->
+    <section class="screen screen-home is-active" id="screenHome">
+
+      <div class="field">
+        <label class="field-label" for="operatorSelect">OPERATOR</label>
+        <select class="field-select" id="operatorSelect"></select>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="testerSelect">TESTER</label>
+        <select class="field-select" id="testerSelect"></select>
+      </div>
+
+      <button class="btn-scan" id="btnScan" type="button">
+        <svg class="btn-scan-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+          <path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+          <line x1="7" y1="12" x2="17" y2="12"/>
+        </svg>
+        SCAN CHARGER
+      </button>
+
+      <div class="stats-row">
+        <div class="stat-card">
+          <span class="stat-value" id="statPending">0</span>
+          <span class="stat-label">PENDING SCANS</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value" id="statToday">0</span>
+          <span class="stat-label">TODAY'S COUNT</span>
+        </div>
+      </div>
+
+      <p class="sync-note" id="syncNote" hidden>Offline scans stored — will upload automatically.</p>
+    </section>
+
+    <!-- ================= SCANNER SCREEN ================= -->
+    <section class="screen screen-scanner" id="screenScanner">
+      <div class="scanner-frame">
+        <!-- Primary preview: native BarcodeDetector path (scanner.js) -->
+        <video id="scan-video" class="scan-video" playsinline muted></video>
+        <!-- Fallback mount: html5-qrcode renders here only if the
+             browser has no native BarcodeDetector -->
+        <div id="qrReader"></div>
+        <div class="scanner-target" aria-hidden="true"></div>
+      </div>
+
+      <p class="scanner-hint">Hold ~10 cm from the label — pinch to zoom, tap to refocus</p>
+
+      <div class="scanner-controls">
+        <button class="btn-secondary" id="btnTorch" type="button">TORCH</button>
+        <select class="field-select scanner-camera" id="cameraSelect" aria-label="Camera"></select>
+        <button class="btn-secondary btn-danger" id="btnCancelScan" type="button">CANCEL</button>
+      </div>
+    </section>
+
+    <!-- ================= SUCCESS SCREEN ================= -->
+    <section class="screen screen-result" id="screenSuccess">
+      <div class="result-icon result-icon-pass" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"
+             stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+      </div>
+      <h2 class="result-title result-title-pass">SUCCESSFULLY SAVED</h2>
+
+      <dl class="result-details">
+        <div class="result-row"><dt>TEST ID</dt><dd id="resTestId">—</dd></div>
+        <div class="result-row"><dt>TIMESTAMP</dt><dd id="resTimestamp">—</dd></div>
+        <div class="result-row"><dt>CHARGER ID</dt><dd id="resChargerId">—</dd></div>
+      </dl>
+
+      <p class="result-note" id="resQueuedNote" hidden>Saved offline — uploads when internet returns.</p>
+
+      <button class="btn-scan" id="btnScanNext" type="button">SCAN NEXT</button>
+    </section>
+
+    <!-- ================= DUPLICATE SCREEN ================= -->
+    <section class="screen screen-result" id="screenDuplicate">
+      <div class="result-icon result-icon-warn" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"
+             stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="14"/><circle cx="12" cy="19" r="0.5"/></svg>
+      </div>
+      <h2 class="result-title result-title-warn">DUPLICATE SCAN</h2>
+      <p class="result-message">This charger was already scanned in the last 30 seconds. Nothing was uploaded.</p>
+
+      <dl class="result-details">
+        <div class="result-row"><dt>CHARGER ID</dt><dd id="dupChargerId">—</dd></div>
+      </dl>
+
+      <button class="btn-scan" id="btnDupScanNext" type="button">SCAN NEXT</button>
+    </section>
+
+    <!-- ================= ERROR SCREEN ================= -->
+    <section class="screen screen-result" id="screenError">
+      <div class="result-icon result-icon-fail" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"
+             stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+      </div>
+      <h2 class="result-title result-title-fail">ERROR</h2>
+      <p class="result-message" id="errMessage">Something went wrong.</p>
+
+      <button class="btn-scan" id="btnErrHome" type="button">BACK TO HOME</button>
+    </section>
+
+  </main>
+
+  <footer class="app-footer">
+    <span class="footer-mark">vecmocon</span>
+    <span class="footer-ver" id="appVersion">v1.1.0</span>
+  </footer>
+
+  <!-- Load order matters: engine -> wiring -> app -->
+  <script src="scanner.js"></script>
+  <script src="scanner-ui.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
