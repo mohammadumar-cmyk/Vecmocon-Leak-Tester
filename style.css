@@ -405,3 +405,32 @@ body {
   .brand-name { font-size: 1.25rem; }
   .stat-value { font-size: 2.1rem; }
 }
+/* ============================================================
+   SCANNER v1.1.0 ADDITIONS — append to the END of style.css
+   ============================================================ */
+
+/* Live camera preview (primary, BarcodeDetector path) */
+.scan-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+/* html5-qrcode fallback mount: fill the frame the same way.
+   scanner.js hides .scan-video automatically when the fallback runs. */
+#qrReader {
+  width: 100%;
+}
+#qrReader video {
+  width: 100% !important;
+  object-fit: cover;
+}
+
+/* Torch button lit state */
+#btnTorch.active {
+  background: #B6D7A8;
+  color: #101418;
+  border-color: #B6D7A8;
+}
