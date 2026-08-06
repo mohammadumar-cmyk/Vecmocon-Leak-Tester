@@ -1,32 +1,29 @@
 /* ============================================================
-   VECMOCON LEAK TESTER — SCAN STATION SCANNER ENGINE (v1.2.0)
+   VECMOCON LEAK TESTER — SCAN STATION SCANNER ENGINE (v1.3.0)
    ============================================================
-   Design goal: lock a SMALL charger QR label as close to the
-   stock camera app's speed as a web page can get.
+   v1.3.0 — DUPLICATE-SCAN FIX on top of the v1.2.0 speed engine.
 
-   How the speed is achieved:
-     1. ONE-TIME INIT, CACHED. Permission probe, camera
-        enumeration and detector construction run once per page
-        life — not on every scanner open. Reopening the camera
-        is a single getUserMedia + play.
-     2. MAIN LENS, EXPLICITLY. facingMode:"environment" often
-        lands on an ultrawide/macro that cannot focus at 10 cm;
-        we enumerate and de-prioritise those by label, and
-        remember the operator's choice per phone.
-     3. HIGH RES + CONTINUOUS AF. 2560x1440 ideal (device clamps
-        to best available), continuous focus, tap-to-refocus.
-     4. HARDWARE ZOOM when the phone exposes it (default 2.5x),
-        DIGITAL CENTER-CROP when it doesn't — small centered
-        labels get concentrated detector pixels either way.
-     5. MULTI-SCALE DETECTION at ~25/sec: tight crop → medium
-        crop → full frame, cycling. Some scale matches whatever
-        distance the operator is holding at.
-     6. QR-ONLY fast detector on crop passes (charger labels are
-        QR); an all-formats detector on full-frame passes keeps
-        1D barcodes working.
-     7. WARM STREAM: stop() is called by the wiring layer with a
-        keep-alive delay, so SCAN NEXT resumes instantly instead
-        of paying a full camera restart.
+   What changed vs v1.2.0 (everything else identical):
+     A. pause() — stops DETECTION but keeps the stream warm.
+        In v1.2.0 the detect loop kept running through the
+        7 s keep-alive window; on SCAN NEXT resume() cleared
+        the lock while the previous label was often still in
+        frame -> instant re-decode -> duplicate records.
+        The wiring layer now pauses detection on soft close
+        and resume() restarts it.
+     B. SAME-CODE COOLDOWN — the engine remembers the last
+        decoded value; the identical code is ignored for
+        SAME_CODE_COOLDOWN_MS even across resume(). A
+        DIFFERENT charger scans with zero delay.
+     C. resume() now fully re-arms: unlocks AND restarts the
+        detect loop if it was paused.
+
+   Speed features carried over from v1.2.0 unchanged:
+     one-time cached init · main-lens selection · 1440p ·
+     continuous AF + tap-to-refocus · hw zoom 2.5x default +
+     pinch · digital-crop fallback · multi-scale detection at
+     ~25/sec · QR-only fast detector on crop passes · warm
+     stream keep-alive (wiring layer) · diagnostics line.
 
    Fallback: browsers without BarcodeDetector use html5-qrcode.
    ============================================================ */
@@ -36,6 +33,12 @@ const SCAN_FORMATS = [
   'qr_code', 'code_128', 'ean_13', 'ean_8',
   'upc_a', 'upc_e', 'code_39'
 ];
+
+// Ignore a re-decode of the SAME value for this long (ms). Long enough
+// to cover show-result -> SCAN NEXT with the phone still on the label;
+// short enough that a deliberate rescan of the same charger (rare but
+// legitimate) works after a few seconds.
+const SAME_CODE_COOLDOWN_MS = 4000;
 
 class ChargerScanner {
   constructor({ videoEl, onScan, onError = () => {} }) {
@@ -50,8 +53,10 @@ class ChargerScanner {
     this.backCameras = [];       // [{ deviceId, label }]
     this.camIndex = 0;
     this.torchOn = false;
-    this.running = false;
-    this.locked = false;         // prevents duplicate fires
+    this.running = false;        // detect loop active?
+    this.locked = false;         // one-fire latch within a scan session
+    this.lastCode = null;        // v1.3.0: same-code cooldown memory
+    this.lastCodeAt = 0;
     this.rafId = null;
     this.fallback = null;        // Html5Qrcode instance if used
     this._initialized = false;   // one-time init done?
@@ -165,9 +170,10 @@ class ChargerScanner {
     if (!this.backCameras.length) throw new Error('NO_CAMERA');
   }
 
+  /** HARD stop: detection off AND camera released. */
   stop() {
     this.running = false;
-    if (this.rafId) cancelAnimationFrame(this.rafId);
+    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
     if (this.fallback) {
       this.fallback.stop().catch(() => {});
       this.fallback = null;
@@ -176,8 +182,39 @@ class ChargerScanner {
     this.stream = this.track = null;
   }
 
-  /** Call after handling an onScan result to accept the next code. */
-  resume() { this.locked = false; }
+  /**
+   * v1.3.0 SOFT stop: detection OFF, stream stays WARM.
+   * Used during the keep-alive window between scans so the previous
+   * label cannot be re-decoded while a result screen is showing —
+   * this was the duplicate-scan bug in v1.2.0.
+   */
+  pause() {
+    this.running = false;
+    if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = null; }
+    if (this.fallback && typeof this.fallback.pause === 'function') {
+      try { this.fallback.pause(true); } catch { /* not started yet */ }
+    }
+    // stream/track intentionally left alive.
+  }
+
+  /**
+   * Re-arm for the next scan. v1.3.0: also restarts the detect loop
+   * if it was paused (the warm SCAN NEXT path). The same-code
+   * cooldown persists across resume() — that's the point of it.
+   */
+  resume() {
+    this.locked = false;
+    if (this.running) return;                 // loop already live
+    if (this.fallback) {
+      this.running = true;
+      try { this.fallback.resume(); } catch { /* ignore */ }
+      return;
+    }
+    if (this.stream && this.qrDetector) {     // warm stream: relight loop
+      this.running = true;
+      this._nativeLoop();
+    }
+  }
 
   /* ---------- camera handling ---------- */
 
@@ -405,9 +442,22 @@ class ChargerScanner {
 
   _hit(text) {
     if (this.locked || !text) return;
+    const code = String(text).trim();
+    if (!code) return;
+
+    // v1.3.0 SAME-CODE COOLDOWN: the identical value within the window
+    // is the previous scan still in frame — not a new charger. A
+    // different value fires immediately (production line speed intact).
+    const now = Date.now();
+    if (code === this.lastCode && now - this.lastCodeAt < SAME_CODE_COOLDOWN_MS) {
+      return;
+    }
+    this.lastCode = code;
+    this.lastCodeAt = now;
+
     this.locked = true;                 // one fire until resume()
     if (navigator.vibrate) navigator.vibrate(60);
-    this.onScan(String(text).trim());
+    this.onScan(code);
   }
 
   /* ---------- misc ---------- */

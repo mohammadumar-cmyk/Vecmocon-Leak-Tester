@@ -9,14 +9,25 @@
      5. Offline mode: queue scans in IndexedDB, auto-sync later
      6. Feedback: success beep, vibration, result screens
 
-   v1.1.0: camera engine replaced. html5-qrcode is now only a
-   fallback inside scanner.js; the primary path uses the native
-   BarcodeDetector with main-lens selection, 1080p, continuous
-   autofocus and 2.5x default zoom for small charger labels.
-   This file no longer touches the camera directly — it receives
-   decoded codes via LeakScanner.onResult, and the camera starts/
-   stops automatically when #screenScanner gains/loses the
-   'is-active' class (observed by scanner-ui.js).
+   v1.3.1 — LOST-ACK DUPLICATE FIX + honest offline detection:
+     - Every scan gets a unique eventId AT SCAN TIME. It is stored
+       with the queued record and sent on EVERY upload attempt, so
+       the server (apps_script.gs with the eventId patch) writes
+       each scan at most once — even when a POST succeeded but its
+       response was lost on factory Wi-Fi and the client retried.
+       This was the root cause of "goes offline then pushes
+       multiple scans".
+     - FETCH_TIMEOUT_MS raised 15 s -> 25 s: Apps Script cold
+       starts regularly take 5-10 s; a slow server is not offline.
+     - After an upload failure flips us to offline, a quick ping
+       retry (5 s) restores ONLINE promptly instead of waiting for
+       the 60 s ping loop — fixes the lingering false OFFLINE pill.
+     - Returning to the app (visibilitychange) pings + syncs.
+
+   v1.2.0: camera engine (scanner.js/scanner-ui.js), native
+   BarcodeDetector, warm stream. This file receives codes via
+   LeakScanner.onResult; the camera starts/stops automatically
+   when #screenScanner gains/loses 'is-active'.
    ============================================================ */
 
 'use strict';
@@ -27,7 +38,6 @@
    ============================================================ */
 const CONFIG = {
   // Google Apps Script Web App URL.
-  // Paste the /exec URL you get after deploying apps_script.gs.
   SCRIPT_URL: 'https://script.google.com/macros/s/AKfycbxEZMEzwbDZwwO95445o1gDCMamqxrAE4kHNylMZypyAeau9tRA_boeBcq7J-Fz7JpT/exec',
 
   // People who operate this scan station. Edit freely.
@@ -46,10 +56,17 @@ const CONFIG = {
   // How often the connection to Apps Script is verified (ms).
   PING_INTERVAL_MS: 60 * 1000,
 
-  // Network timeout for each upload attempt (ms).
-  FETCH_TIMEOUT_MS: 15 * 1000,
+  // Quick re-ping after an upload failure flips us offline (ms).
+  // Restores the ONLINE pill fast when the blip was momentary.
+  OFFLINE_RECHECK_MS: 5 * 1000,
 
-  APP_VERSION: 'v1.2.0'
+  // Network timeout for each upload attempt (ms).
+  // v1.3.1: 25 s — Apps Script COLD STARTS routinely take 5-10 s.
+  // The old 15 s timeout made a slow (but working) server look
+  // offline, which queued the scan and later re-sent it.
+  FETCH_TIMEOUT_MS: 25 * 1000,
+
+  APP_VERSION: 'v1.3.1'
 };
 
 /* ============================================================
@@ -95,8 +112,22 @@ const state = {
   recentScans: new Map(), // chargerId -> last scan epoch ms (duplicate window)
   todayCount: 0,
   syncing: false,         // prevents overlapping sync runs
-  wakeLock: null          // keeps the screen on while scanning
+  wakeLock: null,         // keeps the screen on while scanning
+  offlineRecheck: null    // pending quick re-ping timer
 };
+
+/* ============================================================
+   EVENT ID — idempotency key, minted ONCE per scan.
+   The same id is sent on every retry of that scan, so the server
+   can write the row at most once no matter how many times the
+   client re-sends after a lost response.
+   ============================================================ */
+function makeEventId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  // Older WebView fallback: time + randomness is unique enough here.
+  return 'pwa-' + Date.now().toString(36) + '-' +
+         Math.random().toString(36).slice(2, 10);
+}
 
 /* ============================================================
    INDEXEDDB — offline scan queue
@@ -177,6 +208,19 @@ function showScreen(name) {
 function setConnState(stateName) {
   el.connBadge.dataset.state = stateName;
   el.connText.textContent = stateName.toUpperCase();
+}
+
+/** Flip to offline AND schedule a quick recheck so a momentary blip
+    doesn't leave the pill stuck on OFFLINE until the 60 s ping loop. */
+function goOffline() {
+  state.online = false;
+  setConnState('offline');
+  if (!state.offlineRecheck) {
+    state.offlineRecheck = setTimeout(() => {
+      state.offlineRecheck = null;
+      pingServer().then(ok => { if (ok) syncQueue(); });
+    }, CONFIG.OFFLINE_RECHECK_MS);
+  }
 }
 
 async function pingServer() {
@@ -300,11 +344,7 @@ async function refreshStats() {
 
 /* ============================================================
    SCANNER — navigation only.
-   The camera itself lives in scanner.js / scanner-ui.js:
-     - main back lens selected explicitly (not the ultrawide)
-     - 1080p stream, continuous autofocus, tap-to-refocus
-     - 2.5x default zoom for small charger QR labels (pinch to adjust)
-     - native BarcodeDetector; html5-qrcode only as fallback
+   The camera itself lives in scanner.js / scanner-ui.js.
    ============================================================ */
 function openScanner() {
   state.processingScan = false;
@@ -359,7 +399,11 @@ async function handleScanResult(decodedText) {
     chargerId: chargerId,
     operator: el.operatorSelect.value,
     tester: el.testerSelect.value,
-    scannedAt: new Date().toISOString()
+    scannedAt: new Date().toISOString(),
+    // v1.3.1: idempotency key — minted ONCE here, reused on every
+    // retry of this scan (immediate upload OR queued sync). The
+    // server writes each eventId at most once.
+    eventId: makeEventId()
   };
 
   if (state.online) {
@@ -404,9 +448,10 @@ async function uploadScan(record) {
 
     showError(data.error || 'Server rejected the scan.');
   } catch (_) {
-    // Network died mid-upload — fall back to the offline queue
-    state.online = false;
-    setConnState('offline');
+    // Network died / timed out mid-upload. The write MAY have landed
+    // server-side with the response lost — queueing is SAFE because
+    // the retry carries the same eventId and cannot double-write.
+    goOffline();               // also schedules a quick re-ping
     await saveOffline(record);
   }
 }
@@ -431,7 +476,10 @@ async function saveOffline(record) {
 }
 
 /* ============================================================
-   OFFLINE SYNC — retries queued scans when internet returns
+   OFFLINE SYNC — retries queued scans when internet returns.
+   Records queued by v1.3.1 carry their eventId, so a re-send of
+   a scan whose first attempt actually landed is a no-op server-
+   side (the server answers ok with the original testId).
    ============================================================ */
 async function syncQueue() {
   if (state.syncing || !navigator.onLine) return;
@@ -454,7 +502,8 @@ async function syncQueue() {
           body: JSON.stringify(record)
         });
         const data = await res.json();
-        // Uploaded, or server-side duplicate: either way remove from queue.
+        // Uploaded, deduped by eventId, or charger-window duplicate:
+        // either way this record is DONE — remove from queue.
         if (data.ok || data.duplicate) {
           await queueDelete(item.id);
         } else {
@@ -526,13 +575,17 @@ function wireEvents() {
   window.addEventListener('offline', () => { state.online = false; setConnState('offline'); });
 
   // Release the camera when backgrounded; restart it when the operator
-  // returns with the scanner screen still open (otherwise they'd face
-  // a frozen black preview and have to cancel + reopen)
+  // returns with the scanner screen still open. v1.3.1: returning also
+  // re-checks the server and drains the queue — the common "walked
+  // through a Wi-Fi dead spot" recovery path.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       LeakScanner.close(true);   // hard stop: release the camera when backgrounded
-    } else if (el.screens.scanner.classList.contains('is-active') && !state.processingScan) {
-      LeakScanner.open();
+    } else {
+      pingServer().then(ok => { if (ok) syncQueue(); });
+      if (el.screens.scanner.classList.contains('is-active') && !state.processingScan) {
+        LeakScanner.open();
+      }
     }
   });
 }

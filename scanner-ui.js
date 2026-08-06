@@ -1,22 +1,36 @@
 /* ============================================================
-   VECMOCON LEAK TESTER — SCANNER WIRING LAYER (v1.2.0)
+   VECMOCON LEAK TESTER — SCANNER WIRING LAYER (v1.3.0)
    ============================================================
    Bridges ChargerScanner (scanner.js) to the existing PWA UI.
 
-   FULLY AUTOMATIC:
+   v1.3.0 — DUPLICATE-SCAN FIX:
+     - Soft close now calls scanner.pause() IMMEDIATELY:
+       detection stops the moment the operator leaves the
+       scanner screen, while the camera stream stays warm for
+       KEEP_ALIVE_MS. In v1.2.0 detection kept running behind
+       the result screen, so SCAN NEXT could instantly re-fire
+       on the previous label -> duplicate records.
+     - open() on the warm path calls scanner.resume(), which
+       (v1.3.0 engine) restarts the paused detect loop.
+     - SINGLE DELIVERY PATH: onScan calls the onResult callback
+       if one is registered, otherwise dispatches the
+       'leakscan:result' event — never both. In v1.2.0 both
+       fired; if script.js wired both paths, every decode was
+       handled twice.
+
+   FULLY AUTOMATIC (unchanged from v1.2.0):
      - Watches #screenScanner for the 'is-active' class: camera
        starts when the scanner screen shows and stops when it
        hides. script.js never touches the camera.
-     - WARM STREAM: leaving the scanner screen does a SOFT close —
-       the stream stays alive for KEEP_ALIVE_MS so SCAN NEXT
-       resumes instantly (this is the biggest part of matching
-       the stock camera app's feel). Backgrounding the app or
-       tapping CANCEL stops the camera immediately.
+     - WARM STREAM: leaving the scanner screen keeps the stream
+       alive for KEEP_ALIVE_MS so SCAN NEXT resumes instantly.
+       Backgrounding the app or tapping CANCEL stops the camera
+       immediately.
      - Wires btnTorch, cameraSelect, btnCancelScan.
      - Shows a diagnostic line (engine/resolution/zoom/lens)
        under the scanner hint for field debugging.
 
-   script.js integration (already done in v1.1.x):
+   script.js integration (unchanged):
        LeakScanner.onResult = (code) => handleScanResult(code);
        LeakScanner.close(true)   // on visibilitychange hidden
    ============================================================ */
@@ -60,8 +74,14 @@ const LeakScanner = (() => {
     scanner = new ChargerScanner({
       videoEl: ensureVideo(),
       onScan: (code) => {
-        if (resultCb) resultCb(code);
-        document.dispatchEvent(new CustomEvent('leakscan:result', { detail: { code } }));
+        // v1.3.0: ONE delivery path, not two. If script.js registered
+        // onResult, that's the path; the event exists only as a
+        // fallback for pages that never set the callback.
+        if (resultCb) {
+          resultCb(code);
+        } else {
+          document.dispatchEvent(new CustomEvent('leakscan:result', { detail: { code } }));
+        }
       },
       onError: showError,
     });
@@ -136,11 +156,12 @@ const LeakScanner = (() => {
 
   async function open() {
     // Returning within the keep-alive window: cancel the pending stop
-    // and just re-arm — this is the instant SCAN NEXT path.
+    // and re-arm — this is the instant SCAN NEXT path. v1.3.0:
+    // resume() also restarts the detect loop that pause() stopped.
     if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
     try {
       if (!scanner) buildScanner();
-      if (scanner.running) { scanner.resume(); return; }
+      if (scanner.stream) { scanner.resume(); showDiagnostics(); return; }
       await scanner.start();
       populateCameras();
       wireControls();
@@ -151,7 +172,8 @@ const LeakScanner = (() => {
   }
 
   /**
-   * close()      -> SOFT: keep the stream warm for KEEP_ALIVE_MS
+   * close()      -> SOFT: detection pauses NOW (v1.3.0 — this is the
+   *                 duplicate fix), stream stays warm for KEEP_ALIVE_MS
    *                 (used when navigating to success/duplicate screens)
    * close(true)  -> IMMEDIATE: stop the camera now
    *                 (used on CANCEL and when the app is backgrounded)
@@ -160,9 +182,10 @@ const LeakScanner = (() => {
     if (!scanner) return;
     if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
     if (immediate) { scanner.stop(); return; }
+    scanner.pause();                     // v1.3.0: detector OFF immediately
     stopTimer = setTimeout(() => {
       stopTimer = null;
-      scanner.stop();
+      scanner.stop();                    // camera released after warm window
     }, KEEP_ALIVE_MS);
   }
 
