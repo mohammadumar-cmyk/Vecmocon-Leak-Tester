@@ -47,8 +47,16 @@ const CONFIG = {
   TESTERS: ['Tester 1'],
 
   // Same Charger ID scanned again inside this window = duplicate.
-  // Keep identical to DUPLICATE_WINDOW_SEC in apps_script.gs.
-  DUPLICATE_WINDOW_MS: 30 * 1000,
+  // v1.4.0: raised from 30 s to 10 MINUTES and made PERSISTENT
+  // (survives app restarts via localStorage) — "no repeat on memory".
+  // A genuine re-test (EC reseat etc.) uses the SCAN ANYWAY override
+  // button on the duplicate screen.
+  DUPLICATE_WINDOW_MS: 10 * 60 * 1000,
+
+  // Charger ID format. Anything the camera decodes that does not
+  // match is ignored as a fake/foreign code (also enforced inside
+  // the scan engine itself).
+  VALID_CODE_RE: /^VSC\d{10,20}$/i,
 
   // How often queued offline scans are retried (ms).
   SYNC_INTERVAL_MS: 15 * 1000,
@@ -66,8 +74,39 @@ const CONFIG = {
   // offline, which queued the scan and later re-sent it.
   FETCH_TIMEOUT_MS: 25 * 1000,
 
-  APP_VERSION: 'v1.3.1'
+  APP_VERSION: 'v1.4.0'
 };
+
+// Engine-level validation uses the same regex (scanner.js reads this).
+window.VM_VALID_CODE_RE = CONFIG.VALID_CODE_RE;
+
+/* ============================================================
+   v1.4.0 PERSISTENT SCAN MEMORY — chargerId -> last scan time,
+   stored in localStorage so the duplicate block survives app
+   restarts, reloads and updates. Pruned to 24 h / 300 entries.
+   ============================================================ */
+const SCAN_MEM_KEY = 'vm_scan_memory_v1';
+function loadScanMemory() {
+  try {
+    const obj = JSON.parse(localStorage.getItem(SCAN_MEM_KEY) || '{}');
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    const m = new Map();
+    for (const [id, ts] of Object.entries(obj)) {
+      if (typeof ts === 'number' && ts > cutoff) m.set(id, ts);
+    }
+    return m;
+  } catch (_) { return new Map(); }
+}
+function persistScanMemory(map) {
+  try {
+    let entries = [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 300);
+    localStorage.setItem(SCAN_MEM_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch (_) { /* storage full/blocked — in-memory map still works */ }
+}
+function markScanned(chargerId) {
+  state.recentScans.set(chargerId, Date.now());
+  persistScanMemory(state.recentScans);
+}
 
 /* ============================================================
    DOM REFERENCES
@@ -109,7 +148,7 @@ const el = {
 const state = {
   processingScan: false,  // guards against double-fired scan callbacks
   online: navigator.onLine,
-  recentScans: new Map(), // chargerId -> last scan epoch ms (duplicate window)
+  recentScans: loadScanMemory(), // v1.4.0: persistent — survives restarts
   todayCount: 0,
   syncing: false,         // prevents overlapping sync runs
   wakeLock: null,         // keeps the screen on while scanning
@@ -385,10 +424,20 @@ async function handleScanResult(decodedText) {
 
   const chargerId = String(decodedText).trim();
 
-  // ---------- Client-side duplicate window ----------
+  // ---------- v1.4.0 format validation (defense in depth; the scan
+  // engine already refuses non-matching codes) ----------
+  if (!CONFIG.VALID_CODE_RE.test(chargerId)) {
+    feedbackWarn();
+    showError('Not a charger barcode: "' + chargerId.slice(0, 40) +
+              '" — point the camera at the charger label only.');
+    return;
+  }
+
+  // ---------- Client-side duplicate window (persistent, 10 min) ----------
   const last = state.recentScans.get(chargerId);
   if (last && Date.now() - last < CONFIG.DUPLICATE_WINDOW_MS) {
     feedbackWarn();
+    state.lastBlockedCode = chargerId;   // for the SCAN ANYWAY override
     el.dupChargerId.textContent = chargerId;
     showScreen('duplicate');   // leaving the scanner screen stops the camera
     return;
@@ -406,11 +455,13 @@ async function handleScanResult(decodedText) {
     eventId: makeEventId()
   };
 
-  if (state.online) {
-    await uploadScan(record);
-  } else {
-    await saveOffline(record);
-  }
+  // v1.4.0 CONNECTION FIX: ALWAYS attempt the upload, regardless of
+  // what the ping-based online flag believes. The flag was wrong often
+  // enough ("poor connection even on good internet") that scans were
+  // being queued while the server was perfectly reachable. uploadScan
+  // already falls back to the offline queue on real failure — the
+  // pill is now cosmetic and can never block or misroute a scan.
+  await uploadScan(record);
 }
 
 async function uploadScan(record) {
@@ -425,7 +476,7 @@ async function uploadScan(record) {
     const data = await res.json();
 
     if (data.ok) {
-      state.recentScans.set(record.chargerId, Date.now());
+      markScanned(record.chargerId);
       state.todayCount += 1;
       feedbackSuccess();
       el.resTestId.textContent = data.testId;
@@ -439,7 +490,7 @@ async function uploadScan(record) {
 
     if (data.duplicate) {
       // Server saw this charger recently (e.g. scanned from another phone)
-      state.recentScans.set(record.chargerId, Date.now());
+      markScanned(record.chargerId);
       feedbackWarn();
       el.dupChargerId.textContent = record.chargerId;
       showScreen('duplicate');
@@ -459,7 +510,7 @@ async function uploadScan(record) {
 async function saveOffline(record) {
   try {
     await queueAdd(record);
-    state.recentScans.set(record.chargerId, Date.now());
+    markScanned(record.chargerId);
     feedbackSuccess();
     el.resTestId.textContent = 'ASSIGNED ON UPLOAD';
     // Show LOCAL time to the operator (record.scannedAt is UTC ISO,
@@ -542,7 +593,39 @@ function formatLocalTime(d) {
     ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
 }
 
+/* v1.4.0: a REAL retest (EC reseat, water recheck) must stay possible
+   despite the 10-minute duplicate memory. The duplicate screen gets a
+   SCAN ANYWAY button (injected here — no index.html change needed)
+   that submits the blocked charger deliberately, with a fresh eventId. */
+function injectScanAnywayButton() {
+  const nextBtn = el.btnDupScanNext;
+  if (!nextBtn || document.getElementById('btnDupOverride')) return;
+  const b = document.createElement('button');
+  b.id = 'btnDupOverride';
+  b.textContent = 'SCAN THIS CHARGER ANYWAY';
+  b.className = nextBtn.className;          // reuse existing button styling
+  b.style.marginTop = '10px';
+  b.style.opacity = '0.85';
+  nextBtn.after(b);
+  b.addEventListener('click', async () => {
+    const chargerId = state.lastBlockedCode;
+    if (!chargerId) { showScreen('home'); return; }
+    state.lastBlockedCode = null;
+    state.processingScan = true;
+    const record = {
+      action: 'scan',
+      chargerId: chargerId,
+      operator: el.operatorSelect.value,
+      tester: el.testerSelect.value,
+      scannedAt: new Date().toISOString(),
+      eventId: makeEventId()
+    };
+    await uploadScan(record);
+  });
+}
+
 function wireEvents() {
+  injectScanAnywayButton();
   // Decoded codes arrive here from scanner.js (via scanner-ui.js)
   LeakScanner.onResult = handleScanResult;
 

@@ -40,6 +40,22 @@ const SCAN_FORMATS = [
 // legitimate) works after a few seconds.
 const SAME_CODE_COOLDOWN_MS = 4000;
 
+// v1.4.0 FAKE-SCAN KILLER #1 — FORMAT VALIDATION.
+// Only real charger IDs may fire. Everything else (stray QR posters,
+// URLs, numbers, partial/corrupt decodes like "0.0" or "12345" that
+// have polluted the sheet) is silently ignored and scanning continues.
+// script.js can override via window.VM_VALID_CODE_RE if the ID format
+// ever changes; this default matches every real ID in production:
+// "VSC" followed by 10-20 digits.
+const DEFAULT_VALID_CODE_RE = /^VSC\d{10,20}$/i;
+
+// v1.4.0 FAKE-SCAN KILLER #2 — CONSENSUS. A code must be decoded
+// TWICE within this window before it fires. A single noisy frame can
+// hallucinate a code once; it practically never hallucinates the same
+// wrong code twice in a row. Adds ~80-150 ms, kills misreads.
+const CONFIRM_HITS = 2;
+const CONFIRM_WINDOW_MS = 1500;
+
 class ChargerScanner {
   constructor({ videoEl, onScan, onError = () => {} }) {
     this.video = videoEl;
@@ -445,17 +461,38 @@ class ChargerScanner {
     const code = String(text).trim();
     if (!code) return;
 
-    // v1.3.0 SAME-CODE COOLDOWN: the identical value within the window
-    // is the previous scan still in frame — not a new charger. A
-    // different value fires immediately (production line speed intact).
+    // v1.4.0 GATE 1 — format validation. Not a charger ID => not a scan.
+    const re = (typeof window !== 'undefined' && window.VM_VALID_CODE_RE)
+      ? window.VM_VALID_CODE_RE : DEFAULT_VALID_CODE_RE;
+    if (!re.test(code)) return;
+
     const now = Date.now();
+
+    // GATE 2 — same-code cooldown (previous label still in frame).
     if (code === this.lastCode && now - this.lastCodeAt < SAME_CODE_COOLDOWN_MS) {
       return;
     }
+
+    // v1.4.0 GATE 3 — consensus: require the SAME code CONFIRM_HITS
+    // times in a row inside CONFIRM_WINDOW_MS before firing. A noisy
+    // frame can misread once; it won't misread identically twice.
+    if (!this._pend || this._pend.code !== code ||
+        now - this._pend.ts > CONFIRM_WINDOW_MS) {
+      this._pend = { code, count: 1, ts: now };
+      return;                          // first sighting — wait for confirm
+    }
+    this._pend.count += 1;
+    this._pend.ts = now;
+    if (this._pend.count < CONFIRM_HITS) return;
+    this._pend = null;
+
     this.lastCode = code;
     this.lastCodeAt = now;
 
-    this.locked = true;                 // one fire until resume()
+    // v1.4.0 SINGLE-SHOT: lock AND halt detection in the engine itself,
+    // before the UI even reacts. Nothing can decode past this line.
+    this.locked = true;
+    try { this.pause(); } catch (_) {}
     if (navigator.vibrate) navigator.vibrate(60);
     this.onScan(code);
   }

@@ -1,31 +1,22 @@
 /* ============================================================
-   VECMOCON LEAK TESTER — SCANNER WIRING LAYER (v1.3.0)
+   VECMOCON LEAK TESTER — SCANNER WIRING LAYER (v1.4.0)
    ============================================================
    Bridges ChargerScanner (scanner.js) to the existing PWA UI.
 
-   v1.3.0 — DUPLICATE-SCAN FIX:
-     - Soft close now calls scanner.pause() IMMEDIATELY:
-       detection stops the moment the operator leaves the
-       scanner screen, while the camera stream stays warm for
-       KEEP_ALIVE_MS. In v1.2.0 detection kept running behind
-       the result screen, so SCAN NEXT could instantly re-fire
-       on the previous label -> duplicate records.
-     - open() on the warm path calls scanner.resume(), which
-       (v1.3.0 engine) restarts the paused detect loop.
+   v1.4.0 — SINGLE-SHOT ARCHITECTURE (the permanent duplicate fix):
+     - NO warm keep-alive. One scan = camera fully OFF. Every
+       close() is a hard stop; every open() is a fresh start.
+       The v1.2/1.3 warm-stream window (resume onto a frame that
+       often still showed the previous label) was the root cause
+       of every recurring duplicate — it no longer exists.
      - SINGLE DELIVERY PATH: onScan calls the onResult callback
        if one is registered, otherwise dispatches the
-       'leakscan:result' event — never both. In v1.2.0 both
-       fired; if script.js wired both paths, every decode was
-       handled twice.
+       'leakscan:result' event — never both.
 
-   FULLY AUTOMATIC (unchanged from v1.2.0):
+   FULLY AUTOMATIC:
      - Watches #screenScanner for the 'is-active' class: camera
-       starts when the scanner screen shows and stops when it
+       starts when the scanner screen shows, hard-stops when it
        hides. script.js never touches the camera.
-     - WARM STREAM: leaving the scanner screen keeps the stream
-       alive for KEEP_ALIVE_MS so SCAN NEXT resumes instantly.
-       Backgrounding the app or tapping CANCEL stops the camera
-       immediately.
      - Wires btnTorch, cameraSelect, btnCancelScan.
      - Shows a diagnostic line (engine/resolution/zoom/lens)
        under the scanner hint for field debugging.
@@ -41,9 +32,13 @@ const LeakScanner = (() => {
   let resultCb = null;
   let stopTimer = null;
 
-  // How long the camera stays warm after leaving the scanner screen.
-  // Within this window, SCAN NEXT is instant (no camera restart).
-  const KEEP_ALIVE_MS = 7000;
+  // v1.4.0: KEEP-ALIVE REMOVED. The warm-stream window (7 s in
+  // v1.2/1.3) was the root of every recurring duplicate: SCAN NEXT
+  // within the window resumed detection onto a frame that often still
+  // showed the previous label. One scan = camera fully OFF. SCAN NEXT
+  // does a clean ~1 s restart — slower by a blink, duplicate-proof
+  // by construction.
+  const KEEP_ALIVE_MS = 0;
 
   const $ = id => document.getElementById(id);
 
@@ -155,13 +150,11 @@ const LeakScanner = (() => {
   /* ---------- public API ---------- */
 
   async function open() {
-    // Returning within the keep-alive window: cancel the pending stop
-    // and re-arm — this is the instant SCAN NEXT path. v1.3.0:
-    // resume() also restarts the detect loop that pause() stopped.
+    // v1.4.0: always a fresh start — the camera was fully stopped on
+    // close, so there is no warm path and no resume-onto-old-frame.
     if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
     try {
       if (!scanner) buildScanner();
-      if (scanner.stream) { scanner.resume(); showDiagnostics(); return; }
       await scanner.start();
       populateCameras();
       wireControls();
@@ -179,14 +172,12 @@ const LeakScanner = (() => {
    *                 (used on CANCEL and when the app is backgrounded)
    */
   function close(immediate = false) {
+    // v1.4.0: every close is a HARD close. No warm window, no paused
+    // detector waiting to resume onto a stale frame. Leaving the
+    // scanner screen for ANY reason fully releases the camera.
     if (!scanner) return;
     if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
-    if (immediate) { scanner.stop(); return; }
-    scanner.pause();                     // v1.3.0: detector OFF immediately
-    stopTimer = setTimeout(() => {
-      stopTimer = null;
-      scanner.stop();                    // camera released after warm window
-    }, KEEP_ALIVE_MS);
+    scanner.stop();
   }
 
   /* ---------- auto start/stop on screen switching ---------- */
