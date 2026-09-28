@@ -9,6 +9,13 @@
      5. Offline mode: queue scans in IndexedDB, auto-sync later
      6. Feedback: success beep, vibration, result screens
 
+   v1.5.0 — PER-TESTER BACKEND:
+     - Single SCRIPT_URL replaced by TESTER_URLS {tester: url}.
+       Tester 1 -> original LeakTester sheet, Tester 2 -> LeakTester_2.
+       Ping/stats follow the selected tester; every upload (live or
+       from the offline queue) goes to the URL of the tester the scan
+       was made on.
+
    v1.3.1 — LOST-ACK DUPLICATE FIX + honest offline detection:
      - Every scan gets a unique eventId AT SCAN TIME. It is stored
        with the queued record and sent on EVERY upload attempt, so
@@ -37,14 +44,16 @@
    Edit here; nothing below needs to change.
    ============================================================ */
 const CONFIG = {
-  // Google Apps Script Web App URL.
-  SCRIPT_URL: 'https://script.google.com/macros/s/AKfycbxEZMEzwbDZwwO95445o1gDCMamqxrAE4kHNylMZypyAeau9tRA_boeBcq7J-Fz7JpT/exec',
+  // v1.5.0: ONE Apps Script Web App URL PER TESTER. Each tester
+  // uploads to its own Google Sheet. The dropdown is built from the
+  // keys of this object, in this order. Add a tester = add a line.
+  TESTER_URLS: {
+    'Tester 1': 'https://script.google.com/macros/s/AKfycbxEZMEzwbDZwwO95445o1gDCMamqxrAE4kHNylMZypyAeau9tRA_boeBcq7J-Fz7JpT/exec',
+    'Tester 2': 'https://script.google.com/macros/s/AKfycbxHo9svhhUXF-VTLjpqLxEEldiOQdOpCfkFEaVWMqKJZa-aHKHt9uobU1mzWGiwFG3Ang/exec'
+  },
 
   // People who operate this scan station. Edit freely.
   OPERATORS: ['Umar', 'raj', 'line_man'],
-
-  // Leak tester machines on the line. Edit freely.
-  TESTERS: ['Tester 1'],
 
   // Same Charger ID scanned again inside this window = duplicate.
   // v1.4.0: raised from 30 s to 10 MINUTES and made PERSISTENT
@@ -74,8 +83,20 @@ const CONFIG = {
   // offline, which queued the scan and later re-sent it.
   FETCH_TIMEOUT_MS: 25 * 1000,
 
-  APP_VERSION: 'v1.4.0'
+  APP_VERSION: 'v1.5.0'
 };
+
+// Derived: tester names for the dropdown (do not edit — edit TESTER_URLS).
+CONFIG.TESTERS = Object.keys(CONFIG.TESTER_URLS);
+
+/* Apps Script URL for a tester. With no argument -> the tester currently
+   selected on screen. Queued offline scans carry their own `tester`
+   field, so a scan made on Tester 2 always lands in Tester 2's sheet
+   even if the dropdown was changed before the queue drained. */
+function scriptUrl(tester) {
+  const t = tester || (el.testerSelect && el.testerSelect.value) || CONFIG.TESTERS[0];
+  return CONFIG.TESTER_URLS[t] || CONFIG.TESTER_URLS[CONFIG.TESTERS[0]];
+}
 
 // Engine-level validation uses the same regex (scanner.js reads this).
 window.VM_VALID_CODE_RE = CONFIG.VALID_CODE_RE;
@@ -269,7 +290,7 @@ async function pingServer() {
     return false;
   }
   try {
-    const res = await fetchWithTimeout(CONFIG.SCRIPT_URL + '?action=ping', { method: 'GET' });
+    const res = await fetchWithTimeout(scriptUrl() + '?action=ping', { method: 'GET' });
     const data = await res.json();
     state.online = !!data.ok;
   } catch (_) {
@@ -353,6 +374,8 @@ function populateDropdowns() {
   };
   fill(el.operatorSelect, CONFIG.OPERATORS, 'vm_operator');
   fill(el.testerSelect, CONFIG.TESTERS, 'vm_tester');
+  // v1.5.0: switching tester switches backend — re-check it right away
+  el.testerSelect.addEventListener('change', () => { pingServer().then(refreshStats); });
 }
 
 /* ============================================================
@@ -371,7 +394,7 @@ async function refreshStats() {
 
   if (state.online) {
     try {
-      const res = await fetchWithTimeout(CONFIG.SCRIPT_URL + '?action=stats', { method: 'GET' });
+      const res = await fetchWithTimeout(scriptUrl() + '?action=stats', { method: 'GET' });
       const data = await res.json();
       if (data.ok) {
         state.todayCount = data.todayCount;
@@ -466,7 +489,7 @@ async function handleScanResult(decodedText) {
 
 async function uploadScan(record) {
   try {
-    const res = await fetchWithTimeout(CONFIG.SCRIPT_URL, {
+    const res = await fetchWithTimeout(scriptUrl(record.tester), {
       method: 'POST',
       // text/plain keeps this a CORS "simple request" — required
       // for Google Apps Script; do NOT change to application/json.
@@ -547,7 +570,7 @@ async function syncQueue() {
       const record = Object.assign({}, item);
       delete record.id;
       try {
-        const res = await fetchWithTimeout(CONFIG.SCRIPT_URL, {
+        const res = await fetchWithTimeout(scriptUrl(record.tester), {
           method: 'POST',
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
           body: JSON.stringify(record)
@@ -631,8 +654,8 @@ function wireEvents() {
 
   el.btnScan.addEventListener('click', () => {
     unlockAudio(); // gesture-bound: guarantees the beep works later
-    if (CONFIG.SCRIPT_URL.indexOf('PASTE_YOUR') === 0) {
-      showError('SCRIPT_URL is not configured. Open script.js and paste your Apps Script Web App URL into CONFIG.SCRIPT_URL.');
+    if (!scriptUrl() || scriptUrl().indexOf('PASTE_YOUR') === 0) {
+      showError('No Apps Script URL for ' + el.testerSelect.value + '. Open script.js and add it to CONFIG.TESTER_URLS.');
       return;
     }
     openScanner();
